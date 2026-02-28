@@ -1,17 +1,16 @@
 #!/usr/bin/env tsx
 /**
- * Dominican Republic Law MCP -- Census Script
+ * Belize Law MCP -- Census Script
  *
- * Scrapes consultoria.gov.do to enumerate ALL laws.
- * Uses the ASP.NET MVC search form with CSRF token protection.
+ * Fetches the full law catalog from agm.gov.bz using their
+ * DataTables AJAX API endpoint.
  *
- * Pipeline:
- *   1. GET the main page to obtain session cookie + CSRF token
- *   2. POST search with DocumentTypeCode=1 (Leyes) to get all laws
- *   3. Parse HTML table response for law entries
- *   4. Write data/census.json
+ * Portal structure:
+ *   POST /api-portalLaws/ with { action: 1000 }
+ *   Returns JSON array of [date, title, category, volume, html_link]
+ *   PDF links embedded in last column: /uploads/laws/{hash}_{name}.pdf
  *
- * Source: https://www.consultoria.gov.do/consulta/
+ * Source: https://www.agm.gov.bz
  *
  * Usage:
  *   npx tsx scripts/census.ts
@@ -28,146 +27,58 @@ const __dirname = path.dirname(__filename);
 const DATA_DIR = path.resolve(__dirname, '../data');
 const CENSUS_PATH = path.join(DATA_DIR, 'census.json');
 
-const BASE_URL = 'https://www.consultoria.gov.do';
-const MAIN_URL = `${BASE_URL}/consulta/`;
-const SEARCH_URL = `${BASE_URL}/Consulta/Home/Search?Length=7`;
-
-const USER_AGENT = 'dominican-law-mcp/1.0 (census; https://github.com/Ansvar-Systems/dominican-law-mcp)';
+const API_URL = 'https://www.agm.gov.bz/api-portalLaws/';
+const USER_AGENT = 'belizean-law-mcp/1.0 (https://github.com/Ansvar-Systems/Belizean-law-mcp; hello@ansvar.ai)';
 
 /* ---------- Types ---------- */
 
 interface RawLawEntry {
-  tipo: string;
-  numero: string;
-  titulo: string;
-  gaceta: string;
-  fecha: string;
-  documentId: string;
-  downloadUrl: string;
+  title: string;
+  category: string;
+  pdfUrl: string;
+  date: string;
+  volume: string;
 }
 
-/* ---------- HTTP Helpers ---------- */
+/* ---------- HTTP ---------- */
 
-/**
- * Fetch the main page to get session cookies and CSRF token.
- */
-async function getSessionAndToken(): Promise<{ cookies: string; token: string }> {
-  const response = await fetch(MAIN_URL, {
-    headers: {
-      'User-Agent': USER_AGENT,
-      'Accept': 'text/html',
-    },
-    redirect: 'follow',
-  });
-
-  if (response.status !== 200) {
-    throw new Error(`Failed to load main page: HTTP ${response.status}`);
-  }
-
-  // Extract cookies from response
-  const setCookies = response.headers.getSetCookie?.() ?? [];
-  const cookieHeader = setCookies
-    .map(c => c.split(';')[0])
-    .join('; ');
-
-  const html = await response.text();
-
-  // Extract CSRF token
-  const tokenMatch = html.match(/name="__RequestVerificationToken"[^>]*value="([^"]*)"/);
-  if (!tokenMatch) {
-    throw new Error('Failed to extract CSRF token from main page');
-  }
-
-  return { cookies: cookieHeader, token: tokenMatch[1] };
-}
-
-/**
- * Search for all laws using the ASP.NET MVC form.
- */
-async function searchLaws(cookies: string, token: string): Promise<string> {
-  const body = new URLSearchParams({
-    __RequestVerificationToken: token,
-    DocumentTypeCode: '1', // Leyes
-    DocumentCategory: '0',
-  });
-
-  const response = await fetch(SEARCH_URL, {
+async function fetchCatalog(): Promise<any[]> {
+  const response = await fetch(API_URL, {
     method: 'POST',
     headers: {
       'User-Agent': USER_AGENT,
-      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-      'X-Requested-With': 'XMLHttpRequest',
-      'Accept': '*/*',
-      'Origin': BASE_URL,
-      'Referer': MAIN_URL,
-      'Cookie': cookies,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Accept': 'application/json',
     },
-    body: body.toString(),
-    redirect: 'follow',
+    body: 'action=1000',
   });
 
   if (response.status !== 200) {
-    throw new Error(`Search request failed: HTTP ${response.status}`);
+    throw new Error(`HTTP ${response.status} from AGM API`);
   }
 
-  return response.text();
+  const data = await response.json() as { data: string[][] };
+
+  if (!data.data || !Array.isArray(data.data)) {
+    throw new Error('Unexpected API response: missing data array');
+  }
+
+  return data.data;
 }
 
 /* ---------- Parsing ---------- */
 
-function parseSearchResults(html: string): RawLawEntry[] {
-  const entries: RawLawEntry[] = [];
-
-  // Match table rows with 6 cells
-  const rowRe = /<tr>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<\/tr>/gi;
-  let match: RegExpExecArray | null;
-
-  while ((match = rowRe.exec(html)) !== null) {
-    const tipo = stripTags(match[1]).trim();
-    const numero = stripTags(match[2]).trim();
-    const titulo = decodeEntities(stripTags(match[3]).trim());
-    const gaceta = stripTags(match[4]).trim();
-    const fecha = stripTags(match[5]).trim();
-    const opciones = match[6];
-
-    // Extract documentId from link
-    const docIdMatch = opciones.match(/documentId=(\d+)/);
-    const documentId = docIdMatch ? docIdMatch[1] : '';
-
-    if (documentId && titulo) {
-      entries.push({
-        tipo,
-        numero,
-        titulo,
-        gaceta,
-        fecha,
-        documentId,
-        downloadUrl: `${BASE_URL}/Consulta/Home/FileManagement?documentId=${documentId}&managementType=1`,
-      });
-    }
+function extractPdfUrl(htmlCell: string): string {
+  const match = htmlCell.match(/href=["']([^"']+\.pdf)["']/i);
+  if (match) {
+    const url = match[1];
+    return url.startsWith('http') ? url : `https://www.agm.gov.bz${url.startsWith('/') ? '' : '/'}${url}`;
   }
-
-  return entries;
+  return '';
 }
 
-function stripTags(text: string): string {
-  return text.replace(/<[^>]*>/g, '');
-}
-
-function decodeEntities(text: string): string {
-  return text
-    .replace(/&#209;/g, 'Ñ').replace(/&#241;/g, 'ñ')
-    .replace(/&#193;/g, 'Á').replace(/&#225;/g, 'á')
-    .replace(/&#201;/g, 'É').replace(/&#233;/g, 'é')
-    .replace(/&#205;/g, 'Í').replace(/&#237;/g, 'í')
-    .replace(/&#211;/g, 'Ó').replace(/&#243;/g, 'ó')
-    .replace(/&#218;/g, 'Ú').replace(/&#250;/g, 'ú')
-    .replace(/&#252;/g, 'ü').replace(/&#220;/g, 'Ü')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n)));
+function stripHtml(html: string): string {
+  return html.replace(/<[^>]*>/g, '').trim();
 }
 
 function slugify(text: string): string {
@@ -177,30 +88,38 @@ function slugify(text: string): string {
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
-    .substring(0, 50);
+    .substring(0, 60);
 }
 
-function parseDRDate(dateStr: string): string {
-  // Format: "30/09/1920"
-  const match = dateStr.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);
-  if (match) {
-    const [, day, month, year] = match;
-    return `${year}-${month!.padStart(2, '0')}-${day!.padStart(2, '0')}`;
+function parseEntries(rows: any[]): RawLawEntry[] {
+  const entries: RawLawEntry[] = [];
+
+  for (const row of rows) {
+    if (!Array.isArray(row) || row.length < 5) continue;
+
+    const date = stripHtml(String(row[0] ?? ''));
+    const title = stripHtml(String(row[1] ?? ''));
+    const category = stripHtml(String(row[2] ?? ''));
+    const volume = stripHtml(String(row[3] ?? ''));
+    const pdfUrl = extractPdfUrl(String(row[4] ?? ''));
+
+    if (title.length > 2 && pdfUrl) {
+      entries.push({ title, category, pdfUrl, date, volume });
+    }
   }
-  return '';
+
+  return entries;
 }
 
 function parseArgs(): { limit: number | null } {
   const args = process.argv.slice(2);
   let limit: number | null = null;
-
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--limit' && args[i + 1]) {
       limit = parseInt(args[i + 1], 10);
       i++;
     }
   }
-
   return { limit };
 }
 
@@ -209,69 +128,74 @@ function parseArgs(): { limit: number | null } {
 async function main(): Promise<void> {
   const { limit } = parseArgs();
 
-  console.log('Dominican Republic Law MCP -- Census');
-  console.log('=====================================\n');
-  console.log('  Source: consultoria.gov.do/consulta/');
-  console.log('  Method: ASP.NET MVC search form (POST with CSRF token)');
+  console.log('Belize Law MCP -- Census');
+  console.log('========================\n');
+  console.log('  Source: agm.gov.bz (Attorney General\'s Ministry)');
+  console.log('  Method: DataTables API (POST /api-portalLaws/)');
   if (limit) console.log(`  --limit ${limit}`);
   console.log('');
 
   fs.mkdirSync(DATA_DIR, { recursive: true });
 
-  // Step 1: Get session + CSRF token
-  process.stdout.write('  Getting session and CSRF token... ');
-  const { cookies, token } = await getSessionAndToken();
-  console.log('OK');
+  console.log('  Fetching catalog from AGM API...');
+  const rawRows = await fetchCatalog();
+  console.log(`  API returned ${rawRows.length} rows`);
 
-  // Step 2: Search for all laws
-  process.stdout.write('  Searching for all laws (DocumentTypeCode=1)... ');
-  const searchHtml = await searchLaws(cookies, token);
-  console.log(`OK (${(searchHtml.length / 1024).toFixed(0)} KB response)`);
+  const entries = parseEntries(rawRows);
+  console.log(`  Parsed ${entries.length} laws with PDF links`);
 
-  // Step 3: Parse results
-  process.stdout.write('  Parsing search results... ');
-  const rawEntries = parseSearchResults(searchHtml);
-  console.log(`${rawEntries.length} laws found`);
+  // Deduplicate by title (some entries appear in multiple categories)
+  const seenTitles = new Map<string, RawLawEntry>();
+  for (const entry of entries) {
+    const key = entry.title.toLowerCase();
+    if (!seenTitles.has(key)) {
+      seenTitles.set(key, entry);
+    }
+  }
 
-  // Build census entries
-  const laws = rawEntries
-    .slice(0, limit ?? rawEntries.length)
-    .map((entry, idx) => {
-      const date = parseDRDate(entry.fecha);
-      const id = `do-ley-${entry.numero || idx}-${slugify(entry.titulo).substring(0, 30)}`;
+  const unique = Array.from(seenTitles.values());
+  console.log(`  Unique laws: ${unique.length}`);
+
+  const laws = unique
+    .slice(0, limit ?? unique.length)
+    .map((entry) => {
+      const id = `bz-${slugify(entry.title)}`;
+      const yearMatch = entry.date.match(/(\d{4})/);
+      const year = yearMatch ? yearMatch[1] : '';
+
+      // Classify: Substantive Laws and Acts are primary, SIs are secondary
+      const isSubstantive = entry.category.toLowerCase().includes('substantive')
+        || entry.category.toLowerCase().includes('act');
+      const classification = isSubstantive ? 'ingestable' as const : 'ingestable' as const;
 
       return {
         id,
-        title: entry.titulo,
-        identifier: entry.numero ? `Ley No. ${entry.numero}` : entry.titulo,
-        url: entry.downloadUrl,
+        title: entry.title,
+        identifier: entry.title,
+        url: entry.pdfUrl,
         status: 'in_force' as const,
         category: 'act' as const,
-        classification: entry.downloadUrl ? 'ingestable' as const : 'inaccessible' as const,
+        classification,
         ingested: false,
         provision_count: 0,
         ingestion_date: null as string | null,
-        issued_date: date,
-        gaceta: entry.gaceta,
-        document_id: entry.documentId,
+        issued_date: year ? `${year}-01-01` : '',
+        source_category: entry.category,
       };
     });
 
-  const ingestable = laws.filter(l => l.classification === 'ingestable').length;
-  const inaccessible = laws.filter(l => l.classification === 'inaccessible').length;
-
   const census = {
     schema_version: '2.0',
-    jurisdiction: 'DO',
-    jurisdiction_name: 'Dominican Republic',
-    portal: 'consultoria.gov.do',
+    jurisdiction: 'BZ',
+    jurisdiction_name: 'Belize',
+    portal: 'agm.gov.bz',
     census_date: new Date().toISOString().split('T')[0],
-    agent: 'dominican-law-mcp/census.ts',
+    agent: 'belizean-law-mcp/census.ts',
     summary: {
       total_laws: laws.length,
-      ingestable,
+      ingestable: laws.filter(l => l.classification === 'ingestable').length,
       ocr_needed: 0,
-      inaccessible,
+      inaccessible: 0,
       excluded: 0,
     },
     laws,
@@ -283,8 +207,7 @@ async function main(): Promise<void> {
   console.log('CENSUS COMPLETE');
   console.log('==================================================');
   console.log(`  Total laws discovered:  ${laws.length}`);
-  console.log(`  Ingestable:             ${ingestable}`);
-  console.log(`  Inaccessible:           ${inaccessible}`);
+  console.log(`  Ingestable:             ${census.summary.ingestable}`);
   console.log(`\n  Output: ${CENSUS_PATH}`);
 }
 
