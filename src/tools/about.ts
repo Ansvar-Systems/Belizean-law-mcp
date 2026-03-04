@@ -44,7 +44,7 @@ export function getAbout(db: InstanceType<typeof Database>, context: AboutContex
       {
         name: 'Belize Laws',
         url: 'https://agm.gov.bz',
-        authority: 'Attorney General's Ministry',
+        authority: 'Attorney General\'s Ministry',
       },
     ],
     freshness: {
